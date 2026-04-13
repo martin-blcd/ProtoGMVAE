@@ -1,0 +1,262 @@
+import torch
+from torch import nn
+import numpy as np
+import math
+import logging
+
+
+class MSE:
+    """
+    Mean Squared Error (MSE) loss function.
+    
+    Calculates the mean squared error between the input and the target.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        x_hat (torch.Tensor): Target tensor.
+
+    Returns:
+        torch.Tensor: Computed loss tensor.
+    """
+    def __call__(self, x, x_hat):
+        batch_size = x.shape[0]
+        loss = nn.MSELoss(reduction='none')(x, x_hat)
+        
+        loss = loss.view(batch_size, -1).sum(axis=1)
+
+        return loss
+
+class CrossEntropy:
+    def __call__(self, x, x_hat):
+        batch_size = x.shape[0]
+        loss = nn.CrossEntropyLoss(reduction='none')(x_hat, x)
+        loss = loss.view(batch_size, -1).sum(axis=1)
+        return loss
+
+class BCELogits:
+    """
+    Binary Cross Entropy (BCE) loss function with logits.
+
+    Calculates the binary cross entropy between the input and the target logits.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        px_logits (torch.Tensor): Target tensor representing the logits.
+
+    Returns:
+        torch.Tensor: Computed loss tensor.
+    """
+    def __init__(self, eps=0.0):
+        self.eps = eps
+
+    def __call__(self, x, px_logits):
+        batch_size = x.shape[0]
+        eps = self.eps
+        if eps > 0.0:
+            max_val = np.log(1.0 - eps) - np.log(eps)
+            px_logits = torch.clamp(px_logits, -max_val, max_val)
+        # loss = nn.BCEWithLogitsLoss(reduction="none")(px_logits, x)
+        # we dont use logits: last layer is sigmois
+        loss = nn.BCELoss(reduction="none")(px_logits, x)
+        loss = loss.view(batch_size, -1).sum(axis=1)
+        return loss
+
+
+class TotalLoss:
+    """
+    generative process:
+    p_theta(x, y, z) = p_theta(x|z) p_theta(z|y) p(y)
+    y ~ Cat(y|1/k)
+    z|y ~ N(z|mu_z_theta(y), sigma^2*z_theta(y))
+    x|z ~ B(x|mu_x_theta(z))
+
+    The goal of GMVAE is to estimate the posterior
+    distribution p(z, y|x),
+    which is usually difficult to compute directly.
+    Instead, a factorized posterior,
+    known as the inference model,
+    is commonly used as an approximation:
+
+    q_phi(z, y|x) = q_phi(z|x, y) q_phi(y|x)
+    y|x ~ Cat(y|pi_phi(x))
+    z|x, y ~ N(z|mu_z_phi(x, y), sigma^2z_phi(x, y))
+
+    ELBO = -KL(q_phi(z|x, y) || p_theta(z|y))
+            - KL(q_phi(y|x) || p(y)) + Eq_phi(z|x,y) [log p_theta(x|z)]
+
+    """
+    def __init__(self, k, recon_loss=MSE()):
+        self.k = k
+        self.recon_loss = recon_loss
+
+    def negative_entropy_from_logit(self, qy, qy_logit):
+        """
+        Computes:
+        ???
+        ++++++++++++++++++++++++++++++++++++++++++++
+        H(q, q) = - ∑q*log q
+        H(q, q_logit) = - ∑q*log p(q_logit)
+        p(q_logit) = softmax(qy_logit)
+        H(q, q_logit) = - ∑q*log softmax(qy_logit)
+        ++++++++++++++++++++++++++++++++++++++++++++
+        """
+        nent = torch.sum(qy * torch.nn.LogSoftmax(1)(qy_logit), 1)
+        return nent
+
+    def log_normal(self, x, mu, var, eps=1e-4, axis=-1):
+        """
+        Calculate the element-wise log probability of a normal distribution.
+
+        The function computes the logarithm of the probability density function of a
+        normal distribution given the input tensor `x`, mean tensor `mu`, and variance
+        tensor `var`. It is assumed that `x`, `mu`, and `var` have the same shape.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            mu (torch.Tensor): Mean tensor of the normal distribution.
+            var (torch.Tensor): Variance tensor of the normal distribution.
+            eps (float, optional): A small value added to the variance to avoid numerical instability.
+                Defaults to 0.0.
+            axis (int, optional): The axis along which the log probabilities are summed.
+                Defaults to -1.
+
+        Returns:
+            torch.Tensor: The computed log probability of the normal distribution.
+        """
+        if eps > 0.0:
+            var = torch.add(var, eps)
+        return -0.5 * torch.sum(np.log(2 * math.pi) + torch.log(var) + torch.pow(x - mu, 2) / var, axis)
+
+    def _loss_per_class(self, x, x_hat, z, zm, zv, zm_prior, zv_prior):
+        loss_px_i = self.recon_loss(x, x_hat)
+        loss_px_i += self.log_normal(z, zm, zv) - self.log_normal(z, zm_prior, zv_prior)
+        return loss_px_i - np.log(1/self.k)
+
+    def __call__(self, x, output_dict):
+        qy = output_dict["qy"]
+        qy_logit = output_dict["qy_logit"]
+        px = output_dict["px"]
+        z = output_dict["z"]
+        zm = output_dict["zm"]
+        zv = output_dict["zv"]
+        zm_prior = output_dict["zm_prior"]
+        zv_prior = output_dict["zv_prior"]
+        loss_qy = self.negative_entropy_from_logit(qy, qy_logit)
+        losses_i = []
+        for i in range(self.k):
+            logging.debug(f"Class: {i}")
+            losses_i.append(
+                self._loss_per_class(
+                    x, px[i], z[i], zm[i], torch.exp(zv[i]), zm_prior[i], torch.exp(zv_prior[i]))
+                )
+        loss = torch.stack([loss_qy] + [qy[:, i] * losses_i[i] for i in range(self.k)]).sum(0)
+        # Alternative way to calculate loss:
+        # torch.sum(torch.mul(torch.stack(losses_i), torch.transpose(qy, 1, 0)), dim=0)
+        out_dict = {"cond_entropy": loss_qy.sum(), "total_loss": loss.sum()}
+        return out_dict
+
+
+class ProtoTotalloss(TotalLoss):
+    def __init__(self, k, recon_loss=MSE(), coefs=None):
+        super().__init__(k, recon_loss)
+        if coefs is None:
+            coefs = {'classif':1,'GMVAE':1}
+        self.coefs = coefs
+
+    def _loss_per_component(self, x, x_hat, z, zm, zv, zm_prior, zv_prior):
+        loss_px_i = self.recon_loss(x, x_hat)
+        loss_px_i += self.log_normal(z, zm, zv) - self.log_normal(z, zm_prior, zv_prior)
+        return loss_px_i - np.log(1/self.k)
+
+    def _loss_kl(self, z, zm, zv, zm_prior, zv_prior):
+        loss_kl = self.log_normal(z, zm, zv) - self.log_normal(z, zm_prior, zv_prior)
+        return loss_kl
+
+    def _loss_recons(self,x,x_hat):
+        return self.recon_loss(x, x_hat)
+
+
+    def _loss_classification(self, pred, target):
+        return torch.nn.functional.cross_entropy(pred, target, reduction='none')
+
+    def __call__(self, x, target, output_dict, classif_weights):
+        qy = output_dict["qy"]
+        qy_logit = output_dict["qy_logit"]
+        px = output_dict["px"]
+        z = output_dict["z"]
+        zm = output_dict["zm"]
+        zv = output_dict["zv"]
+        zm_prior = output_dict["zm_prior"]
+        zv_prior = output_dict["zv_prior"]
+        pred_class = output_dict["pred_class"]
+        
+        loss_qy = self.negative_entropy_from_logit(qy, qy_logit)
+        loss_class = self._loss_classification(pred_class, target)
+
+        losses_i = []
+        kl_losses_i = []
+        recons_losses_i = []
+        for i in range(self.k):
+            logging.debug(f"Component: {i}")
+            kl_losses_i.append(self._loss_kl(z[i], zm[i], torch.exp(zv[i]), zm_prior[i], torch.exp(zv_prior[i])))
+            recons_losses_i.append(self._loss_recons(x, px[i]))
+
+
+        kl_loss = torch.stack([kl_losses_i[i] * qy[:,i] for i in range(self.k)]) #for detailed logs
+        kl_loss = kl_loss.sum(0)
+        recons_loss = torch.stack([recons_losses_i[i] * qy[:,i] for i in range(self.k)]) #for detailed logs
+        recons_loss = recons_loss.sum(0)
+        
+        loss = torch.stack([self.coefs['classif'] * loss_class]
+                           + [loss_qy * self.coefs['kl_y']]
+                           + [qy[:, i] * ((kl_losses_i[i] * self.coefs['kl']) + (recons_losses_i[i] * self.coefs['recons']) - np.log(1/self.k)) for i in range(self.k)] #this should be mean over comps
+                           )
+        
+        loss = loss.sum(0) #sum over components
+
+        
+        out_dict = {"cond_entropy": loss_qy.sum(), "total_loss": loss.sum(), "classif_loss": loss_class.sum(),
+                    "kl_loss": kl_loss.sum(), "recons_loss": recons_loss.sum()}
+        return out_dict
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.ERROR,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+    batch_size = 3
+    input_dim = 4
+    k = 5
+    latent_dim = 2
+    p = 0.5  # Probability of success (0 or 1)
+
+    x = torch.bernoulli(torch.full((batch_size, input_dim, input_dim), p))
+    x = x.reshape((batch_size, -1))
+    # x_hat = torch.rand((k, batch_size, input_dim**2))
+    x_hat = 2*torch.stack([x.reshape(batch_size, -1) for i in range(k)]) - 1
+    px = x_hat
+    qy_logit = 2*torch.rand((batch_size, k))
+    qy = torch.nn.functional.softmax(qy_logit, dim=-1)
+    logging.debug(f"initial qy: {qy}")
+    logging.debug(f"initial qy sum: {qy.sum(1)}")
+    z = torch.rand((k, batch_size, latent_dim))
+    zm = zv = torch.rand((k, batch_size, latent_dim))
+    zm_prior = zv_prior = torch.rand((k, batch_size, latent_dim))
+
+    out = {
+            "z": z,
+            "zm": zm,
+            "zv": zv,
+            "zm_prior": zm_prior,
+            "zv_prior": zv_prior,
+            "qy_logit": qy_logit,
+            "qy": qy,
+            "px": px
+            }
+
+    loss = TotalLoss(k=k, recon_loss=MSE())
+    res = loss(x=x.reshape(batch_size, -1), output_dict=out)
+    print(f"Total Loss: {res}")
+
+    loss = TotalLoss(k=k, recon_loss=BCELogits())
+    res = loss(x=x.reshape(batch_size, -1), output_dict=out)
+    print(f"Total Loss: {res}")
